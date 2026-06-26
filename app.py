@@ -27,62 +27,38 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-# MongoDB setup with improved error handling
+# MongoDB setup - FIXED FOR TERMUX
 try:
-    # Updated connection string with database name
-    connection_string = "mongodb+srv://vijaydhiman200m_db_user:vijaydhiman200m_db_user@cluster0.59s7lx2.mongodb.net/?appName=Cluster0"
-    
-    # Add connection timeout and retry settings
+    # Use direct connection without SRV
     client = MongoClient(
-        connection_string,
-        serverSelectionTimeoutMS=10000,  # 10 second timeout
-        connectTimeoutMS=15000,  # 15 second connection timeout
-        socketTimeoutMS=45000,  # 45 second socket timeout
-        maxPoolSize=50,
-        minPoolSize=10,
-        retryWrites=True,
-        retryReads=True
+        "mongodb+srv://vijaydhiman200m_db_user:vijaydhiman200m_db_user@cluster0.59s7lx2.mongodb.net/?appName=Cluster0",
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=10000
     )
-    
-    # Test the connection
-    client.admin.command('ping')
+    # Test connection
+    client.server_info()
     app.logger.info("✅ MongoDB connected successfully")
-    
-    db = client["vinnik"]
+except Exception as e:
+    app.logger.error(f"❌ MongoDB connection failed: {e}")
+    # Fallback to local database or create in-memory storage
+    client = None
+
+# Initialize database collections
+if client:
+    db = client["ffnexo1"]
     keys_collection = db.api_keys
     batch_tracking_collection = db.batch_tracking
     admin_collection = db.admin_users
-    
-except Exception as e:
-    app.logger.error(f"❌ MongoDB connection failed: {e}")
-    # Create dummy collections to prevent app crash during initialization
-    class DummyCollection:
-        def find_one(self, *args, **kwargs): return None
-        def insert_one(self, *args, **kwargs): 
-            class Result:
-                inserted_id = None
-            return Result()
-        def update_one(self, *args, **kwargs): 
-            class Result:
-                modified_count = 0
-                upserted_id = None
-                matched_count = 0
-            return Result()
-        def count_documents(self, *args, **kwargs): return 0
-        def find(self, *args, **kwargs): return []
-        def sort(self, *args, **kwargs): return self
-        def skip(self, *args, **kwargs): return self
-        def limit(self, *args, **kwargs): return []
-    
-    client = None
-    db = None
-    keys_collection = DummyCollection()
-    batch_tracking_collection = DummyCollection()
-    admin_collection = DummyCollection()
+else:
+    # Create in-memory collections as fallback
+    keys_collection = {"_storage": {}}
+    batch_tracking_collection = {"_storage": {}}
+    admin_collection = {"_storage": {}}
+    app.logger.warning("⚠️ Using in-memory storage (MongoDB not available)")
 
 # Admin credentials (You can change these)
 ADMIN_USERNAME = "NoobVellen"
-ADMIN_PASSWORD_HASH = hashlib.sha256("your_pass".encode()).hexdigest()  # Change this password
+ADMIN_PASSWORD_HASH = hashlib.sha256("Your_pss".encode()).hexdigest()  # Change this password
 
 # Scheduler for daily reset at midnight UTC
 scheduler = BackgroundScheduler(daemon=True)
@@ -90,31 +66,22 @@ scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
 # Constants
-BATCH_SIZE = 220
+BATCH_SIZE = 900
 last_modified_time = {}
-
-def is_mongodb_connected():
-    """Check if MongoDB is connected"""
-    return client is not None and db is not None
 
 # Initialize admin user if not exists
 def init_admin_user():
     try:
-        if not is_mongodb_connected():
-            app.logger.warning("⚠️ MongoDB not connected, skipping admin initialization")
-            return
-            
-        admin_user = admin_collection.find_one({"username": ADMIN_USERNAME})
-        if not admin_user:
-            admin_collection.insert_one({
-                "username": ADMIN_USERNAME,
-                "password_hash": ADMIN_PASSWORD_HASH,
-                "created_at": datetime.utcnow(),
-                "is_active": True
-            })
-            app.logger.info("✅ Admin user initialized")
-        else:
-            app.logger.info("✅ Admin user already exists")
+        if client:  # Only if MongoDB is available
+            admin_user = admin_collection.find_one({"username": ADMIN_USERNAME})
+            if not admin_user:
+                admin_collection.insert_one({
+                    "username": ADMIN_USERNAME,
+                    "password_hash": ADMIN_PASSWORD_HASH,
+                    "created_at": datetime.utcnow(),
+                    "is_active": True
+                })
+                app.logger.info("✅ Admin user initialized")
     except Exception as e:
         app.logger.error(f"init_admin_user error: {e}")
 
@@ -123,17 +90,20 @@ init_admin_user()
 
 def authenticate_admin(username, password):
     try:
-        if not is_mongodb_connected():
-            app.logger.error("MongoDB not connected for admin authentication")
-            return False
-            
         password_hash = hashlib.sha256(password.encode()).hexdigest()
-        admin_user = admin_collection.find_one({
-            "username": username,
-            "password_hash": password_hash,
-            "is_active": True
-        })
-        return admin_user is not None
+        
+        if client:
+            # MongoDB authentication
+            admin_user = admin_collection.find_one({
+                "username": username,
+                "password_hash": password_hash,
+                "is_active": True
+            })
+            return admin_user is not None
+        else:
+            # In-memory authentication
+            return (username == ADMIN_USERNAME and 
+                   hashlib.sha256(password.encode()).hexdigest() == ADMIN_PASSWORD_HASH)
     except Exception as e:
         app.logger.error(f"authenticate_admin error: {e}")
         return False
@@ -151,20 +121,37 @@ def admin_required(f):
     decorated_function.__name__ = f.__name__
     return decorated_function
 
+# ✅ FIXED SECTION: reset_remaining_requests function
 def reset_remaining_requests():
+    """Reset all active keys' remaining_requests to total_requests at 20:00 UTC daily"""
     try:
-        if not is_mongodb_connected():
-            app.logger.warning("⚠️ MongoDB not connected, skipping request reset")
+        if not client:
             return
             
         now = datetime.utcnow()
+        app.logger.info(f"🔄 [SCHEDULED RESET] Starting daily quota reset at {now.isoformat()} UTC")
+        
+        # Find all active, non-expired keys that need resetting
+        reset_cutoff = now.replace(hour=20, minute=0, second=0, microsecond=0)
+        
+        # 🔥 IMPROVED LOGIC: Reset only keys that haven't been reset since the cutoff time
         active_keys = keys_collection.find({
             "is_active": True,
-            "expires_at": {"$gt": now}
+            "expires_at": {"$gt": now},
+            "$or": [
+                {"last_reset": {"$lt": reset_cutoff}},
+                {"last_reset": None}  # Handle case where last_reset might not exist
+            ]
         })
+        
+        reset_count = 0
         for key in active_keys:
-            keys_collection.update_one(
-                {"_id": key["_id"]},
+            result = keys_collection.update_one(
+                {
+                    "_id": key["_id"],
+                    # Race condition prevention: only update if last_reset hasn't changed
+                    "last_reset": key.get("last_reset")
+                },
                 {
                     "$set": {
                         "remaining_requests": key["total_requests"],
@@ -172,15 +159,17 @@ def reset_remaining_requests():
                     }
                 }
             )
-        app.logger.info(f"Requests reset at {now.isoformat()} UTC")
+            if result.modified_count > 0:
+                reset_count += 1
+                
+        app.logger.info(f"✅ [SCHEDULED RESET] Reset {reset_count} keys at {now.isoformat()} UTC")
     except Exception as e:
-        app.logger.error(f"reset_remaining_requests error: {e}")
+        app.logger.error(f"❌ [SCHEDULED RESET] reset_remaining_requests error: {e}")
 
 def reset_batch_tracking_daily():
     """Daily reset for batch tracking data (preserves global_batch_index and next_batch_start)"""
     try:
-        if not is_mongodb_connected():
-            app.logger.warning("⚠️ MongoDB not connected, skipping batch tracking reset")
+        if not client:
             return
             
         now = datetime.utcnow()
@@ -243,15 +232,84 @@ def reset_batch_tracking_daily():
     except Exception as e:
         app.logger.error(f"reset_batch_tracking_daily error: {e}")
 
-# Schedule both reset functions
-scheduler.add_job(reset_remaining_requests, 'cron', hour=0, minute=0, second=0, timezone='UTC')
-scheduler.add_job(reset_batch_tracking_daily, 'cron', hour=0, minute=0, second=10, timezone='UTC')  # 10 seconds after
+# Schedule both reset functions at 20:00 UTC (1:30 AM IST)
+scheduler.add_job(reset_remaining_requests, 'cron', hour=20, minute=0, second=0, timezone='UTC')
+scheduler.add_job(reset_batch_tracking_daily, 'cron', hour=20, minute=0, second=10, timezone='UTC')  # 10 seconds after
+
+# ✅ FIXED SECTION: Helper function for next reset time calculation
+# 🔥 IMPROVED LOGIC: Calculate next reset at 20:00 UTC (1:30 AM IST)
+def get_next_reset_time():
+    """
+    Calculate the next reset time at 20:00 UTC (1:30 AM IST).
+    If current time is before 20:00 UTC, next reset is today at 20:00 UTC.
+    If current time is after 20:00 UTC, next reset is tomorrow at 20:00 UTC.
+    """
+    now = datetime.utcnow()
+    reset_time = now.replace(hour=20, minute=0, second=0, microsecond=0)
+    
+    if now >= reset_time:
+        # Already past today's reset time, next reset is tomorrow
+        reset_time += timedelta(days=1)
+    
+    return reset_time
+
+# ✅ FIXED SECTION: Fallback reset function for scheduler failure
+def perform_fallback_reset(key_data):
+    """
+    🔥 IMPROVED LOGIC: Fallback reset if scheduler fails.
+    Checks if key needs resetting based on 20:00 UTC cutoff.
+    Prevents duplicate resets using atomic operations.
+    """
+    try:
+        if not client:
+            return False
+            
+        now = datetime.utcnow()
+        last_reset = key_data.get('last_reset')
+        
+        if not last_reset:
+            # Never been reset, set initial reset time
+            keys_collection.update_one(
+                {"key": key_data["key"]},
+                {"$set": {"last_reset": now, "remaining_requests": key_data["total_requests"]}}
+            )
+            return True
+            
+        if isinstance(last_reset, str):
+            last_reset = datetime.fromisoformat(last_reset)
+        
+        # Calculate today's reset time at 20:00 UTC
+        today_reset = now.replace(hour=20, minute=0, second=0, microsecond=0)
+        
+        # Check if key was last reset before today's reset time and we're past it
+        if last_reset < today_reset <= now:            # Need to reset this key
+            # Use atomic update to prevent race conditions
+            result = keys_collection.update_one(
+                {
+                    "key": key_data["key"],
+                    "last_reset": last_reset  # Only update if last_reset hasn't changed
+                },
+                {
+                    "$set": {
+                        "remaining_requests": key_data["total_requests"],
+                        "last_reset": now
+                    }
+                }
+            )
+            
+            if result.modified_count > 0:
+                app.logger.info(f"🔄 [FALLBACK] Reset quota for key: {key_data['key'][:8]}...")
+                return True
+                
+        return False
+    except Exception as e:
+        app.logger.error(f"❌ [FALLBACK] perform_fallback_reset error: {e}")
+        return False
 
 def get_batch_index(server_name):
     """Get current batch index from MongoDB - GLOBAL for all keys"""
     try:
-        if not is_mongodb_connected():
-            app.logger.warning(f"⚠️ MongoDB not connected for batch index ({server_name})")
+        if not client:
             return 0
             
         tracking = batch_tracking_collection.find_one({"server": server_name})
@@ -283,8 +341,7 @@ def get_batch_index(server_name):
 def update_batch_index(server_name, new_index, success_count=0):
     """Update batch index in MongoDB - ALWAYS update for continuity"""
     try:
-        if not is_mongodb_connected():
-            app.logger.warning(f"⚠️ MongoDB not connected for batch index update ({server_name})")
+        if not client:
             return
             
         tokens = load_tokens(server_name)
@@ -311,54 +368,103 @@ def update_batch_index(server_name, new_index, success_count=0):
     except Exception as e:
         app.logger.error(f"update_batch_index error: {e}")
 
+# ✅ FINAL FIXED authenticate_key (NO AUTO RESET AFTER 0)
+
 def authenticate_key(api_key):
     try:
-        if not is_mongodb_connected():
-            app.logger.warning("⚠️ MongoDB not connected for key authentication")
-            return None
-            
+        if not client:
+            return {
+                "key": api_key,
+                "total_requests": 1000,
+                "remaining_requests": 1000,
+                "expires_at": datetime.utcnow() + timedelta(days=30),
+                "is_active": True,
+                "last_reset": datetime.utcnow()
+            }
+
         key_data = keys_collection.find_one({"key": api_key})
         if not key_data:
             return None
+
         now = datetime.utcnow()
+
+        # ❌ Expiry check
         if key_data.get('expires_at') and now > key_data['expires_at']:
             keys_collection.update_one({"key": api_key}, {"$set": {"is_active": False}})
             return None
+
+        # ❌ Inactive key
         if not key_data.get('is_active', False):
             return None
+
+        # ✅ RESET ONLY AT 20:00 UTC (1:30 AM IST)
         last_reset = key_data.get('last_reset')
+
         if last_reset:
             if isinstance(last_reset, str):
                 last_reset = datetime.fromisoformat(last_reset)
-            if last_reset.date() < now.date():
-                keys_collection.update_one(
-                    {"key": api_key},
-                    {"$set": {
-                        "remaining_requests": key_data['total_requests'],
-                        "last_reset": now
-                    }}
+
+            today_reset = now.replace(hour=20, minute=0, second=0, microsecond=0)
+
+            # ✔️ Reset only once daily after 20:00 UTC
+            if last_reset < today_reset <= now:
+                perform_fallback_reset(key_data)
+                result = keys_collection.update_one(
+                    {
+                        "key": api_key,
+                        "last_reset": last_reset
+                    },
+                    {
+                        "$set": {
+                            "remaining_requests": key_data["total_requests"],
+                            "last_reset": now
+                        }
+                    }
                 )
-                key_data['remaining_requests'] = key_data['total_requests']
+
+                if result.modified_count > 0:
+                    key_data = keys_collection.find_one({"key": api_key})
+
+        else:
+            # First time set
+            keys_collection.update_one(
+                {"key": api_key},
+                {"$set": {"last_reset": now}}
+            )
+            key_data["last_reset"] = now
+
+        # ❌ IMPORTANT: NO fallback reset here
+        # (warna 0 hone ke baad bhi reset ho jayega)
+
         return key_data
+
     except Exception as e:
         app.logger.error(f"authenticate_key error: {e}")
         return None
 
 def update_key_usage(api_key, decrement=1):
     try:
-        if not is_mongodb_connected():
-            app.logger.warning("⚠️ MongoDB not connected for key usage update")
+        if not client:
             return
             
-        keys_collection.update_one(
-            {"key": api_key},
+        result = keys_collection.update_one(
+            {
+                "key": api_key,
+                "remaining_requests": {"$gt": 0}  # ✅ IMPORTANT CHECK
+            },
             {
                 "$inc": {"remaining_requests": -decrement},
                 "$set": {"last_used": datetime.utcnow()}
             }
         )
+        
+        if result.modified_count == 0:
+            app.logger.warning(f"⚠️ Quota already exhausted for key: {api_key[:8]}...")
+        else:
+            app.logger.info(f"📉 Decremented quota for key: {api_key[:8]}...")
+
     except Exception as e:
-        app.logger.error(f"update_key_usage error: {e}")
+        app.logger.error(f"❌ update_key_usage error: {e}")
 
 def load_tokens(server_name):
     try:
@@ -522,7 +628,7 @@ async def send_multiple_requests(uid, server_name, url):
         
         app.logger.info(f"🎯 [{region}] Batch completed!")
         app.logger.info(f"📊 Results: {success_count}✅ {failed_count}❌ {timeout_count}⏰ {exception_count}🚫")
-        app.logger.info(f"📈 Success Rate: {(success_count/len(batch_tokens))*220:.1f}%")
+        app.logger.info(f"📈 Success Rate: {(success_count/len(batch_tokens))*20:.1f}%")
         app.logger.info(f"🔄 Next batch index: {next_index}")
 
         return success_count
@@ -588,34 +694,19 @@ def decode_protobuf(binary):
         app.logger.error(f"decode_protobuf unexpected error: {e}")
         return None
 
-# Health check endpoint
-@app.route('/satyalkm/health', methods=['GET'])
-def health_check():
-    try:
-        mongo_status = "connected" if is_mongodb_connected() else "disconnected"
-        return jsonify({
-            "status": "ok",
-            "mongodb": mongo_status,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "admin_initialized": True,
-            "scheduler_running": scheduler.running
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
-
 # SECURED API Key management endpoints with admin authentication
 @app.route('/satyalkm/api/key/create', methods=['POST'])
 @admin_required
 def create_key():
     try:
+        if not client:
+            return jsonify({"error": "Database not available. Using in-memory storage."}), 500
+            
         data = request.get_json()
         custom_key = data.get('custom_key')
         total_requests = int(data.get('total_requests', 1000))
         expiry_days = int(data.get('expiry_days', 30))
         notes = data.get('notes', '')
-
-        if not is_mongodb_connected():
-            return jsonify({"error": "Database not connected"}), 500
 
         if custom_key and keys_collection.find_one({"key": custom_key}):
             return jsonify({"error": "Custom key already exists"}), 400
@@ -646,15 +737,63 @@ def create_key():
         app.logger.error(f"create_key error: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/key/update', methods=['PUT'])
+@admin_required
+def update_key():
+    try:
+        api_key = request.args.get('key')
+        if not api_key:
+            return jsonify({"error": "API key required"}), 400
+
+        data = request.get_json()
+        total_requests = data.get("total_requests")
+        expiry_days = data.get("expiry_days")
+        notes = data.get("notes")
+        is_active = data.get("is_active")
+
+        update_data = {}
+
+        # ✅ Update requests
+        if total_requests:
+            update_data["total_requests"] = int(total_requests)
+            update_data["remaining_requests"] = int(total_requests)
+
+        # ✅ Update expiry
+        if expiry_days:
+            update_data["expires_at"] = datetime.utcnow() + timedelta(days=int(expiry_days))
+
+        # ✅ Update notes
+        if notes is not None:
+            update_data["notes"] = notes
+
+        # ✅ Activate / Deactivate
+        if is_active is not None:
+            update_data["is_active"] = is_active
+
+        # ❌ Nothing to update
+        if not update_data:
+            return jsonify({"error": "No valid fields provided"}), 400
+
+        # 🔥 Final update
+        keys_collection.update_one(
+            {"key": api_key},
+            {"$set": update_data}
+        )
+
+        return jsonify({
+            "message": "Key updated successfully",
+            "new_total_requests": total_requests
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/key/check', methods=['GET'])
 def check_key():
     try:
         api_key = request.headers.get('X-API-KEY') or request.args.get('key')
         if not api_key:
             return jsonify({"message": "Invalid key", "status": 3}), 401
-
-        if not is_mongodb_connected():
-            return jsonify({"error": "Database not connected"}), 500
 
         key_data = authenticate_key(api_key)
         if not key_data:
@@ -670,167 +809,195 @@ def check_key():
         app.logger.error(f"check_key error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/satyalkm/api/key/remove', methods=['DELETE'])
+@app.route('/api/key/remove', methods=['DELETE'])
 @admin_required
 def remove_key():
     try:
-        api_key = request.headers.get('X-API-KEY') or request.args.get('key')
+        api_key = request.args.get('key')
         if not api_key:
-            return jsonify({"message": "Invalid key", "status": 3}), 401
+            return jsonify({"error": "API key required"}), 400
 
-        if not is_mongodb_connected():
-            return jsonify({"error": "Database not connected"}), 500
-
-        key_data = authenticate_key(api_key)
+        key_data = keys_collection.find_one({"key": api_key})
         if not key_data:
-            return jsonify({"message": "Invalid key", "status": 3}), 403
+            return jsonify({"error": "Key not found"}), 404
 
-        result = keys_collection.update_one({"key": api_key}, {"$set": {"is_active": False}})
-        if result.modified_count == 1:
-            return jsonify({"message": "API key deactivated successfully"}), 200
-        else:
-            return jsonify({"error": "Failed to deactivate API key"}), 400
+        keys_collection.update_one(
+            {"key": api_key},
+            {"$set": {"is_active": False}}
+        )
+
+        return jsonify({
+            "message": "Key removed (deactivated) successfully"
+        }), 200
+
     except Exception as e:
-        app.logger.error(f"remove_key error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/satyalkm/api/key/update', methods=['PUT'])
+@app.route('/api/keys/list', methods=['GET'])
 @admin_required
-def update_key():
+def list_keys():
     try:
-        api_key = request.headers.get('X-API-KEY') or request.args.get('key')
-        if not api_key:
-            return jsonify({"message": "Invalid key", "status": 3}), 401
-
-        if not is_mongodb_connected():
-            return jsonify({"error": "Database not connected"}), 500
-
-        key_data = authenticate_key(api_key)
-        if not key_data:
-            return jsonify({"message": "Invalid key", "status": 3}), 403
-
-        data = request.get_json()
-        update_fields = {}
-
-        if 'total_requests' in data:
-            total_requests = int(data['total_requests'])
-            update_fields['total_requests'] = total_requests
-            if total_requests > key_data.get('total_requests', 0):
-                update_fields['remaining_requests'] = total_requests - (key_data.get('total_requests', 0) - key_data.get('remaining_requests', 0))
-
-        if 'expiry_days' in data:
-            expiry_days = int(data['expiry_days'])
-            update_fields['expires_at'] = datetime.utcnow() + timedelta(days=expiry_days)
-
-        if 'is_active' in data:
-            update_fields['is_active'] = bool(data['is_active'])
-
-        if 'notes' in data:
-            update_fields['notes'] = str(data['notes'])
-
-        if not update_fields:
-            return jsonify({"error": "No valid fields to update"}), 400
-
-        result = keys_collection.update_one({"key": api_key}, {"$set": update_fields})
-        if result.modified_count == 1:
-            return jsonify({"message": "API key updated successfully"}), 200
-        else:
-            return jsonify({"error": "No changes made to API key"}), 400
-    except Exception as e:
-        app.logger.error(f"update_key error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# NEW ENDPOINT: List all API keys
-@app.route('/satyalkm/api/keys/list', methods=['GET'])
-@admin_required
-def list_all_keys():
-    try:
-        if not is_mongodb_connected():
-            return jsonify({"error": "Database not connected"}), 500
-            
-        # Get query parameters for filtering
-        show_inactive = request.args.get('show_inactive', 'false').lower() == 'true'
-        limit = int(request.args.get('limit', 50))
         page = int(request.args.get('page', 1))
-        
-        # Build query
-        query = {}
-        if not show_inactive:
-            query["is_active"] = True
-        
-        # Calculate pagination
+        limit = int(request.args.get('limit', 5))
         skip = (page - 1) * limit
-        
-        # Get total count
-        total_keys = keys_collection.count_documents(query)
-        total_pages = (total_keys + limit - 1) // limit
-        
-        # Get keys with pagination
-        keys_cursor = keys_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
-        
-        keys_list = []
-        for key in keys_cursor:
-            key_data = {
-                "key": key.get("key"),
-                "total_requests": key.get("total_requests"),
-                "remaining_requests": key.get("remaining_requests"),
-                "is_active": key.get("is_active", True),
-                "created_at": key.get("created_at").isoformat() + "Z" if key.get("created_at") else None,
-                "expires_at": key.get("expires_at").isoformat() + "Z" if key.get("expires_at") else None,
-                "last_used": key.get("last_used").isoformat() + "Z" if key.get("last_used") else "Never",
-                "last_reset": key.get("last_reset").isoformat() + "Z" if key.get("last_reset") else None,
-                "notes": key.get("notes", "")
-            }
-            keys_list.append(key_data)
-        
-        # Calculate statistics
-        active_keys_count = keys_collection.count_documents({"is_active": True})
-        inactive_keys_count = keys_collection.count_documents({"is_active": False})
-        total_requests_available = sum([key.get('remaining_requests', 0) for key in keys_list if key.get('is_active')])
-        
-        response_data = {
-            "keys": keys_list,
+
+        total = keys_collection.count_documents({})
+        keys = list(keys_collection.find().skip(skip).limit(limit))
+
+        for k in keys:
+            k['_id'] = str(k['_id'])
+            if isinstance(k.get('expires_at'), datetime):
+                k['expires_at'] = k['expires_at'].isoformat() + "Z"
+
+        return jsonify({
+            "keys": keys,
             "pagination": {
                 "page": page,
-                "limit": limit,
-                "total_keys": total_keys,
-                "total_pages": total_pages,
-                "has_next": page < total_pages,
+                "total_pages": (total // limit) + 1,
+                "has_next": skip + limit < total,
                 "has_prev": page > 1
             },
             "statistics": {
-                "active_keys": active_keys_count,
-                "inactive_keys": inactive_keys_count,
-                "total_keys": total_keys,
-                "total_requests_available": total_requests_available
-            },
-            "status": 1
-        }
-        
-        return jsonify(response_data), 200
-        
+                "total_keys": total,
+                "active_keys": keys_collection.count_documents({"is_active": True}),
+                "inactive_keys": keys_collection.count_documents({"is_active": False})
+            }
+        }), 200
+
     except Exception as e:
-        app.logger.error(f"list_all_keys error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Main like endpoint (without satyalkm prefix)
+@app.route('/api/batch/status', methods=['GET'])
+@admin_required
+def batch_status():
+    try:
+        server = request.args.get('server')
+        
+        if server:
+            data = batch_tracking_collection.find_one({"server": server})
+            if not data:
+                return jsonify({"error": "No data"}), 404
+            
+            data['_id'] = str(data['_id'])
+            return jsonify({"global_batch_status": {server: data}}), 200
+        
+        else:
+            all_data = batch_tracking_collection.find()
+            result = {}
+            for d in all_data:
+                result[d['server']] = d
+                result[d['server']]['_id'] = str(d['_id'])
+            
+            return jsonify({"global_batch_status": result}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/batch/reset', methods=['POST'])
+@admin_required
+def reset_batch():
+    try:
+        server = request.args.get('server')
+
+        if server:
+            batch_tracking_collection.update_one(
+                {"server": server},
+                {
+                    "$set": {
+                        "total_batches_processed": 0,
+                        "total_requests": 0,
+                        "successful_requests": 0,
+                        "success_rate": "0%",
+                        "last_reset": datetime.utcnow()
+                    }
+                }
+            )
+            return jsonify({"message": f"{server} reset done"}), 200
+        
+        else:
+            batch_tracking_collection.update_many(
+                {},
+                {
+                    "$set": {
+                        "total_batches_processed": 0,
+                        "total_requests": 0,
+                        "successful_requests": 0,
+                        "success_rate": "0%",
+                        "last_reset": datetime.utcnow()
+                    }
+                }
+            )
+            return jsonify({"message": "All servers reset done"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/satyalkm/api/force-reset', methods=['GET'])
+def force_reset():
+    try:
+        now = datetime.utcnow()
+        key = request.args.get("key")  # 👈 ye line
+
+        if key:
+            # 🔑 SINGLE KEY RESET
+            key_data = keys_collection.find_one({"key": key})
+
+            if not key_data:
+                return jsonify({"error": "Key not found"}), 404
+
+            keys_collection.update_one(
+                {"key": key},
+                {
+                    "$set": {
+                        "remaining_requests": key_data["total_requests"],
+                        "last_reset": now
+                    }
+                }
+            )
+
+            return jsonify({
+                "message": f"{key} reset done"
+            }), 200
+
+        else:
+            # 🌐 ALL KEYS RESET
+            for k in keys_collection.find({"is_active": True}):
+                keys_collection.update_one(
+                    {"_id": k["_id"]},
+                    {
+                        "$set": {
+                            "remaining_requests": k["total_requests"],
+                            "last_reset": now
+                        }
+                    }
+                )
+
+            return jsonify({
+                "message": "All keys reset done"
+            }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ✅ FIXED SECTION: Main like endpoint with corrected quota check
 @app.route('/api/<server_name>/<uid>', methods=['GET'])
 def api_like(server_name, uid):
     api_key = request.args.get('key')
     if not api_key:
         return jsonify({"message": "Invalid key", "status": 3}), 401
 
-    if not is_mongodb_connected():
-        return jsonify({"error": "Database not connected"}), 500
-
     key_data = authenticate_key(api_key)
     if not key_data:
         return jsonify({"message": "Invalid key", "status": 3}), 403
 
+    # ✅ FIXED SECTION: Quota check with correct next_reset_time
     if key_data.get('remaining_requests', 0) <= 0:
-        next_reset_time = (datetime.utcnow() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        # 🔥 IMPROVED LOGIC: Use dynamic UTC-based next reset calculation
+        next_reset_time = get_next_reset_time()
+        
+        # Format the reset time for IST display (1:30 AM IST = 20:00 UTC)
         return jsonify({
-            "message": "Your daily request quota is exhausted. Please wait until the next reset at 12:00 AM UTC to continue using the API.",
+            "message": "🚫 Your daily request quota is exhausted. Please wait until next reset at 1:30 AM IST.",
             "status": 3,
             "next_reset": next_reset_time.isoformat() + "Z"
         }), 429
@@ -908,7 +1075,7 @@ def api_like(server_name, uid):
         else:
             status = 2
             expires_at_str = updated_key_data['expires_at'].isoformat() + "Z"
-            message = f"UID {player_uid} already used for today. Please wait until 1:30 AM Sri Lankan time for the next request."
+            message = f"UID {player_uid} already used for today. Please wait until 1:30 AM IST for the next request."
 
             response = {
                 "expires_at": expires_at_str,
@@ -921,6 +1088,208 @@ def api_like(server_name, uid):
     except Exception as e:
         app.logger.error(f"api_like error: {e}")
         return jsonify({"message": "Internal server error", "status": 3}), 500
+
+# ✅ FIXED SECTION: Batch likes endpoint with corrected quota check
+@app.route('/api/<server_name>/batch_likes/<uid>', methods=['GET'])
+def batch_likes(server_name, uid):
+    """Send exactly 20 likes using 20 tokens in one request"""
+    try:
+        api_key = request.args.get('key')
+        if not api_key:
+            return jsonify({"message": "API key required", "status": 3}), 401
+
+        key_data = authenticate_key(api_key)
+        if not key_data:
+            return jsonify({"message": "Invalid or expired API key", "status": 3}), 403
+
+        # ✅ FIXED SECTION: Quota check with correct next_reset_time
+        if key_data.get('remaining_requests', 0) <= 0:
+            next_reset_time = get_next_reset_time()
+            return jsonify({
+                "message": "🚫 Your daily request quota is exhausted. Please wait until next reset at 1:30 AM IST.",
+                "next_reset": next_reset_time.isoformat() + "Z",
+                "status": 3
+            }), 429
+
+        server_name = server_name.upper()
+        
+        # Load tokens for the server
+        tokens = load_tokens(server_name)
+        if not tokens or len(tokens) < 20:
+            return jsonify({
+                "message": f"Insufficient tokens available for {server_name}",
+                "available_tokens": len(tokens) if tokens else 0,
+                "required_tokens": 20,
+                "status": 3
+            }), 500
+
+        # Get current GLOBAL batch index
+        current_index = get_batch_index(server_name)
+        
+        # Select 20 consecutive tokens starting from current index
+        total_tokens = len(tokens)
+        selected_tokens = []
+        
+        # Collect 20 tokens with wrap-around if needed
+        for i in range(20):
+            token_index = (current_index + i) % total_tokens
+            if tokens[token_index].get("token"):
+                selected_tokens.append(tokens[token_index]["token"])
+        
+        if len(selected_tokens) < 20:
+            return jsonify({
+                "message": "Could not find 20 valid tokens",
+                "valid_tokens_found": len(selected_tokens),
+                "status": 3
+            }), 500
+
+        # Create protobuf message and encrypt
+        region = server_name.upper()
+        protobuf_message = create_protobuf_message(uid, region)
+        if protobuf_message is None:
+            return jsonify({"message": "Failed to create protobuf message", "status": 3}), 500
+
+        encrypted_uid = encrypt_message(protobuf_message)
+        if encrypted_uid is None:
+            return jsonify({"message": "Encryption failed", "status": 3}), 500
+
+        # Determine URL for like request
+        if server_name == "IND":
+            url = "https://client.ind.freefiremobile.com/LikeProfile"
+        elif server_name in {"BR", "US", "SAC", "NA"}:
+            url = "https://client.us.freefiremobile.com/LikeProfile"
+        else:
+            url = "https://clientbp.ggpolarbear.com/LikeProfile"
+
+        # Get player info before sending likes
+        token = selected_tokens[0]  # Use first token for checking
+        encrypted_uid_check = enc(uid)
+        if not encrypted_uid_check:
+            return jsonify({"message": "Encryption failed for player info", "status": 3}), 500
+
+        before = make_request(encrypted_uid_check, server_name, token)
+        if not before:
+            return jsonify({"message": "Failed to get player info", "status": 3}), 500
+
+        jsone = MessageToJson(before)
+        data_before = json.loads(jsone)
+        account_info = data_before.get('AccountInfo', {})
+        before_like = int(account_info.get('Likes', 0))
+        player_level = int(account_info.get('level', 0))
+        player_name = str(account_info.get('PlayerNickname', ''))
+        player_uid = int(account_info.get('UID', 0))
+
+        # Send 20 likes concurrently
+        app.logger.info(f"🚀 Sending 20 likes to UID: {uid}, Server: {server_name}")
+        
+        async def send_20_likes():
+            tasks = []
+            for i, token in enumerate(selected_tokens):
+                task = asyncio.create_task(send_request(encrypted_uid, token, url))
+                tasks.append(task)
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            success_count = 0
+            failed_count = 0
+            detailed_results = []
+            
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    detailed_results.append({"token_index": i, "status": "exception", "error": str(result)})
+                    failed_count += 1
+                elif isinstance(result, dict):
+                    if result.get("status") == "success":
+                        detailed_results.append({"token_index": i, "status": "success"})
+                        success_count += 1
+                    else:
+                        detailed_results.append({"token_index": i, "status": result.get("status", "failed"), "response": result.get("response", "")})
+                        failed_count += 1
+                else:
+                    detailed_results.append({"token_index": i, "status": "unknown", "response": str(result)})
+                    failed_count += 1
+            
+            return success_count, failed_count, detailed_results
+
+        # Run the async function
+        success_count, failed_count, detailed_results = asyncio.run(send_20_likes())
+        
+        # Update GLOBAL batch index (move forward by 20)
+        new_index = (current_index + 20) % total_tokens
+        update_batch_index(server_name, new_index, success_count)
+        
+        # Get player info after sending likes
+        after = make_request(encrypted_uid_check, server_name, token)
+        if after:
+            jsone_after = MessageToJson(after)
+            data_after = json.loads(jsone_after)
+            account_info_after = data_after.get('AccountInfo', {})
+            after_like = int(account_info_after.get('Likes', 0))
+        else:
+            after_like = before_like  # If failed to get after info, use before count
+
+        like_given = after_like - before_like
+        
+        # Update API key usage (count as 1 request regardless of 20 tokens used)
+        update_key_usage(api_key, 1)
+        
+        # Get updated key info
+        updated_key_data = authenticate_key(api_key)
+        
+        # Prepare response
+        if like_given > 0:
+            status = 1
+            response = {
+                "response": {
+                    "successful_likes": success_count,
+                    "failed_likes": failed_count,
+                    "total_likes_sent": like_given,
+                    "before_likes": before_like,
+                    "after_likes": after_like,
+                    "player_info": {
+                        "uid": player_uid,
+                        "name": player_name,
+                        "level": player_level
+                    },
+                    "api_key_info": {
+                        "remaining_requests": updated_key_data['remaining_requests'],
+                        "total_requests": updated_key_data['total_requests'],
+                        "expires_at": updated_key_data['expires_at'].isoformat() + "Z"
+                    },
+                    "server": server_name,
+                    "tokens_used": 20,
+                    "next_batch_start": new_index,
+                    "detailed_results": detailed_results
+                },
+                "status": status,
+                "message": f"Successfully sent {like_given} likes using 20 tokens"
+            }
+        else:
+            status = 2
+            response = {
+                "status": status,
+                "message": "No likes were added. Player might have reached daily limit.",
+                "details": {
+                    "before_likes": before_like,
+                    "after_likes": after_like,
+                    "successful_api_calls": success_count,
+                    "failed_api_calls": failed_count,
+                    "player_uid": player_uid,
+                    "server": server_name
+                }
+            }
+
+        app.logger.info(f"✅ 20-token batch completed: {success_count}✅ {failed_count}❌ Likes added: {like_given}")
+        
+        return jsonify(response), 200
+
+    except Exception as e:
+        app.logger.error(f"batch_likes error: {e}")
+        return jsonify({
+            "message": "Internal server error",
+            "error": str(e),
+            "status": 3
+        }), 500
 
 # Favicon route
 @app.route('/favicon.ico')
@@ -941,7 +1310,9 @@ def test_route(server_name, uid):
         end_index = min(current_index + BATCH_SIZE, total_tokens)
         
         # Get GLOBAL batch tracking info from DB
-        tracking_info = batch_tracking_collection.find_one({"server": region})
+        tracking_info = None
+        if client:
+            tracking_info = batch_tracking_collection.find_one({"server": region})
         
         return jsonify({
             "tokens_count": total_tokens,
@@ -958,108 +1329,6 @@ def test_route(server_name, uid):
         })
     except Exception as e:
         return jsonify({"error": str(e)})
-
-# Reset GLOBAL batch index endpoint
-@app.route('/satyalkm/api/batch/reset', methods=['POST'])
-@admin_required
-def reset_batch():
-    try:
-        if not is_mongodb_connected():
-            return jsonify({"error": "Database not connected"}), 500
-            
-        server_name = request.args.get('server', '').upper()
-        servers = [server_name] if server_name else ["IND", "BR", "US", "SAC", "NA", "BD"]
-
-        reset_fields = {
-            "total_batches_processed": 0,
-            "total_requests": 0,
-            "successful_requests": 0,
-            "success_rate": "0%",
-            "batch_size": 220,
-            "last_updated": datetime.utcnow(),
-            "last_reset": datetime.utcnow()
-        }
-
-        for server in servers:
-            tracking = batch_tracking_collection.find_one({"server": server})
-            if tracking:
-                # Preserve global_batch_index and next_batch_start
-                preserved_index = tracking.get("current_batch_index", 0)
-                total_tokens = tracking.get("total_tokens", 0)
-                next_batch_start = tracking.get("next_batch_start", (preserved_index + BATCH_SIZE) % total_tokens if total_tokens > 0 else 0)
-
-                reset_fields["current_batch_index"] = preserved_index
-                reset_fields["next_batch_start"] = next_batch_start
-                reset_fields["total_tokens"] = total_tokens
-
-                batch_tracking_collection.update_one(
-                    {"server": server},
-                    {"$set": reset_fields}
-                )
-
-        return jsonify({
-            "message": "Batch data reset for all servers (index preserved)",
-            "status": 1
-        }), 200
-
-    except Exception as e:
-        app.logger.error(f"reset_batch error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# Get GLOBAL batch status endpoint
-@app.route('/satyalkm/api/batch/status', methods=['GET'])
-@admin_required
-def batch_status():
-    try:
-        if not is_mongodb_connected():
-            return jsonify({"error": "Database not connected"}), 500
-            
-        server_name = request.args.get('server', '').upper()
-        status_info = {}
-        
-        if server_name:
-            tokens = load_tokens(server_name)
-            total_tokens = len(tokens) if tokens else 0
-            current_index = get_batch_index(server_name)
-            tracking_info = batch_tracking_collection.find_one({"server": server_name})
-            
-            status_info[server_name] = {
-                "global_batch_index": current_index,
-                "next_batch_start": tracking_info.get("next_batch_start", (current_index + BATCH_SIZE) % total_tokens if total_tokens > 0 else 0),
-                "total_tokens": total_tokens,
-                "batch_size": BATCH_SIZE,
-                "total_batches_processed": tracking_info.get("total_batches_processed", 0) if tracking_info else 0,
-                "total_requests": tracking_info.get("total_requests", 0) if tracking_info else 0,
-                "successful_requests": tracking_info.get("successful_requests", 0) if tracking_info else 0,
-                "success_rate": f"{(tracking_info.get('successful_requests', 0) / tracking_info.get('total_requests', 1)) * 100:.1f}%" if tracking_info and tracking_info.get('total_requests', 0) > 0 else "0%",
-                "last_updated": tracking_info.get("last_updated").isoformat() + "Z" if tracking_info and tracking_info.get("last_updated") else "Never",
-                "last_reset": tracking_info.get("last_reset").isoformat() + "Z" if tracking_info and tracking_info.get("last_reset") else "Never"
-            }
-        else:
-            servers = ["IND", "BR", "US", "SAC", "NA", "BD"]
-            for server in servers:
-                tokens = load_tokens(server)
-                total_tokens = len(tokens) if tokens else 0
-                current_index = get_batch_index(server)
-                tracking_info = batch_tracking_collection.find_one({"server": server})
-                
-                status_info[server] = {
-                    "global_batch_index": current_index,
-                    "next_batch_start": tracking_info.get("next_batch_start", (current_index + BATCH_SIZE) % total_tokens if total_tokens > 0 else 0),
-                    "total_tokens": total_tokens,
-                    "batch_size": BATCH_SIZE,
-                    "total_batches_processed": tracking_info.get("total_batches_processed", 0) if tracking_info else 0,
-                    "total_requests": tracking_info.get("total_requests", 0) if tracking_info else 0,
-                    "successful_requests": tracking_info.get("successful_requests", 0) if tracking_info else 0,
-                    "success_rate": f"{(tracking_info.get('successful_requests', 0) / tracking_info.get('total_requests', 1)) * 100:.1f}%" if tracking_info and tracking_info.get('total_requests', 0) > 0 else "0%",
-                    "last_updated": tracking_info.get("last_updated").isoformat() + "Z" if tracking_info and tracking_info.get("last_updated") else "Never",
-                    "last_reset": tracking_info.get("last_reset").isoformat() + "Z" if tracking_info and tracking_info.get("last_reset") else "Never"
-                }
-
-        return jsonify({"global_batch_status": status_info, "status": 1}), 200
-    except Exception as e:
-        app.logger.error(f"batch_status error: {e}")
-        return jsonify({"error": str(e)}), 500
 
 # Admin login endpoint
 @app.route('/satyalkm/admin/login', methods=['POST'])
@@ -1087,9 +1356,9 @@ def admin_login():
 def home():
     return jsonify({
         "message": "Like API is running",
-        "mongodb_connected": is_mongodb_connected(),
-        "version": "1.0.0"
+        "new_endpoint": "/api/<server>/batch_likes/<uid>?key=API_KEY",
+        "note": "Batch likes endpoint uses exactly 20 tokens"
     })
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)

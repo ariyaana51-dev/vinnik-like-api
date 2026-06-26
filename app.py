@@ -521,7 +521,8 @@ async def send_request(encrypted_uid, token, url):
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=edata, headers=headers, timeout=30) as resp:
                 response_text = await resp.text()
-                app.logger.info(f"🔥 LikeProfile Response: {response_text}")
+                app.logger.info(f"HTTP: {resp.status}")
+                app.logger.info(f"LikeProfile Response: {repr(response_text)}")
                 if resp.status != 200:
                     app.logger.error(f"send_request failed status: {resp.status}, response: {response_text}")
                     return f"ERROR:{resp.status}"

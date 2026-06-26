@@ -48,7 +48,7 @@ try:
     client.admin.command('ping')
     app.logger.info("✅ MongoDB connected successfully")
     
-    db = client["garenafreefire"]
+    db = client["vinnik"]
     keys_collection = db.api_keys
     batch_tracking_collection = db.batch_tracking
     admin_collection = db.admin_users

@@ -1049,6 +1049,9 @@ def api_like(server_name, uid):
         data_after = json.loads(jsone_after)
         account_info_after = data_after.get('AccountInfo', {})
         after_like = int(account_info_after.get('Likes', 0))
+        app.logger.info(f"Before Likes: {before_like}")
+        app.logger.info(f"After Likes : {after_like}")
+        app.logger.info(f"Like Added  : {after_like - before_like}")
 
         like_given = after_like - before_like
 

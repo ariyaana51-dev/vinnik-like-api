@@ -3,7 +3,7 @@ import os
 import asyncio
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from google.protobuf.json_format import MessageToJson
+from google.protobuf.json_format import MesfsageToJson
 import binascii
 import aiohttp
 import requests
@@ -554,7 +554,7 @@ def make_request(encrypt, server_name, token):
         elif server_name in {"BR", "US", "SAC", "NA"}:
             url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
         else:
-            url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
+            url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
 
         edata = bytes.fromhex(encrypt)
         headers = {
@@ -866,7 +866,7 @@ def api_like(server_name, uid):
         elif server_name in {"BR", "US", "SAC", "NA"}:
             url = "https://client.us.freefiremobile.com/LikeProfile"
         else:
-            url = "https://clientbp.ggblueshark.com/LikeProfile"
+            url = "https://clientbp.ggpolarbear.com/LikeProfile"
 
         # Send batch requests
         success_count = asyncio.run(send_multiple_requests(uid, server_name, url))

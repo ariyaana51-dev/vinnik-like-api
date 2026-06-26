@@ -1,0 +1,10 @@
+Flask
+pymongo
+requests
+aiohttp
+googleapis-common-protos
+pycryptodome
+protobuf
+Werkzeug
+apscheduler
+urllib3

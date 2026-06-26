@@ -8,3 +8,5 @@ protobuf
 Werkzeug
 apscheduler
 urllib3
+tzlocal
+pytz
